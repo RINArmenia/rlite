@@ -1,0 +1,15 @@
+obj-m += rlite.o
+rlite-y := ctrl-dev.o io-dev.o utils.o ker-numtables.o bufs.o normal-common.o memtrack.o
+
+obj-m += rlite-shim-loopback.o
+rlite-shim-loopback-y := shim-loopback.o
+
+obj-m += rlite-shim-eth.o
+rlite-shim-eth-y := shim-eth.o
+
+# PWD must be the kernel/ directory
+EXTRA_CFLAGS := -I$(PWD)/../include
+EXTRA_CFLAGS += -g -Werror
+
+obj-m += rlite-normal.o
+rlite-normal-y := normal.o

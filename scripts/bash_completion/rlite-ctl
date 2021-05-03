@@ -1,0 +1,49 @@
+ipcps_list() {
+    rlite-ctl ipcps-show | tail -n +2 | cut -d "," -f 2 | sed  "s| *name='\([^']\+\)'|\1|"
+}
+
+difs_list() {
+    rlite-ctl ipcps-show | tail -n +2 | cut -d "," -f 4 | sed  "s| *dif_name='\([^']\+\)'|\1|"
+}
+
+_rlite_ctl() {
+    local cur=${COMP_WORDS[COMP_CWORD]}
+    local prev=${COMP_WORDS[COMP_CWORD-1]}
+    local pprev=${COMP_WORDS[COMP_CWORD-2]}
+
+    SCHEDS="pfifo wrr"
+
+    case "$pprev" in
+        ipcp-config )
+            CHOICES="address ttl csum flow-del-wait-ms sched queued drop-fract"
+        ;;
+        ipcp-sched-config )
+            CHOICES=$SCHEDS
+        ;;
+        quantum )
+            CHOICES="weights"
+        ;;
+    esac
+
+    case "$prev" in
+        rlite-ctl )
+            CHOICES=$(rlite-ctl -h | tail -n +2 | grep -o "^    [^ ]\+")
+        ;;
+        dif-* )
+            CHOICES=$(difs_list)
+        ;;
+        ipcp-* | uipcp* )
+            CHOICES=$(ipcps_list)
+        ;;
+        wrr | pfifo )
+            CHOICES="qsize"
+        ;;
+        sched )
+            CHOICES=$SCHEDS
+        ;;
+    esac
+
+    COMPREPLY=( $(compgen -W "$CHOICES" -- $cur) )
+}
+
+complete -F _rlite_ctl rlite-ctl
