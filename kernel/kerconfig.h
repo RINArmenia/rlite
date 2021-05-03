@@ -1,0 +1,5 @@
+#ifndef __RLITE_KERCONFIG_H__
+#define __RLITE_KERCONFIG_H__
+#define RL_HAVE_CHRDEV_RW_ITER
+#define RL_KERNEL_MODULES_OK
+#endif

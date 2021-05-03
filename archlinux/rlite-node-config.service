@@ -1,0 +1,13 @@
+[Unit]
+Description=startup utility to create and configure IPCPs
+ConditionPathExists=/etc/rina/initscript
+Requires=rlite.service
+After=rlite.service
+
+[Service]
+Type=simple
+ExecStart=/usr/bin/rlite-node-config -v
+#WorkingDirectory=
+
+[Install]
+WantedBy=multi-user.target

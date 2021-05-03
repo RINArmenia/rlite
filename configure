@@ -1,0 +1,525 @@
+#!/bin/bash
+
+
+printmsg() {
+    echo "$@" | tee -a config.log
+}
+
+no_cmake() {
+    printmsg "Cannot find CMake, required for build of userspace components"
+    exit 255
+}
+
+
+generate_flavours() {
+    printmsg "Generating IPCP flavours ..."
+
+    # Read the file line by line
+    while read -r line || [[ -n "$line" ]]; do
+        # Parse the line to get space separated items
+        read -ra ITEMS <<< "$line"
+
+        if [[ ${line:0:1} == "#" ]]; then
+            # Skip comments
+            continue
+        fi
+
+        FLAVOUR="${ITEMS[0]}"
+        CCMACROS="-DIPCPFLAVOUR=-${FLAVOUR} "
+
+        # Check that flavour name is ok
+        if ! [[ $FLAVOUR =~ ^[a-z]+$ ]]; then
+            printmsg "Invalid flavour name <$FLAVOUR>"
+            exit 255
+        fi
+
+        # Scan the items
+        for asstr in "${ITEMS[@]}"; do
+            # For each item, try to parse it in the form "field=size"
+            IFS='=' read -ra ASSIGN <<< "$asstr"
+            if [ ${#ASSIGN[@]} == "2" ]; then
+                # It is in the form "field=size"
+                FIELD=${ASSIGN[0]}
+                SIZE=${ASSIGN[1]}
+
+                # make sure size makes sense
+                case $SIZE in
+                    "1"|"2"|"4"|"8")
+                        # ok
+                        BITSIZE=$((SIZE * 8))
+                        ;;
+                    *)
+                        printmsg "Invalid field size <$SIZE>"
+                        exit 255
+                        ;;
+                esac
+                case ${FIELD} in
+                    "addr"|"seq"|"pdulen"|"cepid"|"qosid")
+                        CCMACROS=$CCMACROS"-Drl_${FIELD}_t=uint${BITSIZE}_t "
+                        ;;
+                    *)
+                        printmsg "Unknown EFCP field <$FIELD>"
+                        exit 255
+                        ;;
+                esac
+            fi
+        done
+
+        # Generate the Makefile chunk
+        echo "" >> kernel/Makefile
+        echo "obj-m += rlite-normal-${FLAVOUR}.o" >> kernel/Makefile
+        echo "rlite-normal-${FLAVOUR}-y := normal-${FLAVOUR}.o" >> kernel/Makefile
+        #echo "ccflags-rlite-normal-${FLAVOUR}-y += $CCMACROS" >> kernel/Makefile
+        echo "CFLAGS_normal-${FLAVOUR}.o = $CCMACROS" >> kernel/Makefile
+
+        # Generate a symbolic link towards normal.o
+        (cd kernel && ln -sf normal.c normal-${FLAVOUR}.c)
+
+    done < "flavours.conf"
+    printmsg "... flavours generated"
+}
+
+KTESTDIR="tmp-kernel-test-dir"
+KTESTOBJS=""
+
+add_test() {
+    {
+        cat <<EOF
+        #include <linux/module.h>
+        #include <linux/kernel.h>
+        #include <linux/init.h>
+EOF
+        cat  # output the test code read from stdin
+    } > $KTESTDIR/$1.c
+    {
+        cat <<EOF
+##############################################################################
+#             TEST:  $1
+##############################################################################
+EOF
+        cat $KTESTDIR/$1.c
+    } >> config.log
+    # Add a new kernel module to the running list
+    KTESTOBJS="$1.o $KTESTOBJS"
+}
+
+probe_kernel_features() {
+    # Clean-up leftovers.
+    rm -rf $KTESTDIR
+    mkdir $KTESTDIR
+
+    cat >> config.log <<EOF
+##############################################################################
+#	      KERNEL PROBING TESTS
+##############################################################################
+EOF
+
+    # Add tests one by one, starting with a dummy test to make sure we are
+    # able to compile kernel modules.
+    add_test 'KERNEL_MODULES_OK' <<EOF
+        int dummy(int x) {
+            return x;
+        }
+EOF
+
+    add_test 'HAVE_CHRDEV_RW_ITER' <<EOF
+        #include <linux/fs.h>
+        void dummy(void) {
+            struct file_operations *fops = NULL;
+            (void)fops->write_iter;
+            (void)fops->read_iter;
+        }
+EOF
+
+    add_test 'SIGNAL_PENDING_IN_SCHED_SIGNAL' <<EOF
+        #include <linux/sched/signal.h>
+
+        int dummy(void) {
+            return signal_pending(NULL);
+        }
+EOF
+
+    add_test 'SK_DATA_READY_SECOND_ARG' <<EOF
+        #include <net/sock.h>
+
+        void dummy(void) {
+            struct sock *sk = NULL;
+            sk->sk_data_ready(sk, 0);
+        }
+EOF
+
+    add_test 'HAVE_TIMER_SETUP' <<EOF
+        #include <linux/timer.h>
+
+        static void timer_fun(struct timer_list *t) {
+        }
+
+        void dummy(void) {
+            struct timer_list tmr;
+            timer_setup(&tmr, timer_fun, 0);
+        }
+EOF
+
+    add_test 'HAVE_UDP_READER_QUEUE' <<EOF
+        #include <net/sock.h>
+        #include <linux/udp.h>
+
+        struct sk_buff_head *dummy(void) {
+            struct sock *sk = NULL;
+            return &udp_sk(sk)->reader_queue;
+        }
+EOF
+
+    # Generate a Makefile for the tests.
+    cat >> $KTESTDIR/Makefile <<EOF
+ifneq (\$(KERNELRELEASE),)
+# Each test is compiled as a separate kernel module.
+obj-m := ${KTESTOBJS}
+else
+all:
+	make -C ${KERNBUILDDIR} M=\$\$PWD
+endif
+EOF
+
+    # Run tests.
+    {
+        cat <<EOF
+##############################################################################
+# BEGIN RUNNING TESTS: $(date)
+##############################################################################
+## Makefile:
+EOF
+        cat $KTESTDIR/Makefile
+        cat <<EOF
+##############################################################################
+EOF
+    } >> config.log
+    (
+        cd $KTESTDIR
+        make -k -j $(grep -c processor /proc/cpuinfo)
+    )  >> config.log 2>&1
+    #eval "$TESTPOSTPROC"
+    cat >> config.log <<EOF
+##############################################################################
+# END RUNNING TESTS: $(date)
+##############################################################################
+EOF
+
+    # Check if we were able to compile kernel modules, collect test results
+    # and define proper macros in the kernel configuration file ($KCF).
+    for kobj in $KTESTOBJS; do
+        if [ -f $KTESTDIR/$kobj ]; then
+            macro=$(echo $kobj | sed 's|\.o$||g')
+            macro="#define RL_${macro}"
+            echo $macro >> ${KCF}
+        elif [ $kobj == "KERNEL_MODULES_OK.o" ]; then
+            printmsg "Error: failed to build kernel modules in $KERNBUILDDIR"
+            printmsg "Check config.log for details"
+            exit 255
+        fi
+    done
+}
+
+usage() {
+    cat <<EOF
+configure options:
+
+    --help                      Show this help and exit
+    --prefix                    [/] Prefix path for installation of kernel and user components
+    --kernbuilddir              Path to the kernel directory to use for out-of-tree module compilation
+    --shim-udp4                 Enable shim-udp4
+    --no-shim-udp4              Disable shim-udp4
+    --shim-tcp4                 Enable shim-tcp4
+    --no-shim-tcp4              Disable shim-tcp4
+    --skbuffs                   Use Linux native skbuffs for PDU data/metadata (better performance)
+    --no-skbuffs                Use custom packet representation for PDU data/metadata
+    --swig                      Use swig to generate python bindings
+    --no-swig                   Don't use swig to generate python bindings
+    --verbose-kernel            Compile (conditional) verbose kernel logs (may slow down a bit)
+    --debug                     Compile in debug mode
+    --opt                       Compile with optimizations enabled (-O2)
+    --no-kernel                 Don't build kernel code
+    --no-user                   Don't build userspace code
+    --sanitize-includes         Use IWYU if available
+    --clang                     Use clang/clang++ compilers for the build
+EOF
+}
+
+
+# Default parameter values
+
+WITH_SHIM_TCP4="y"
+WITH_SHIM_UDP4="y"
+WITH_SKBUFFS="n"
+WITH_SWIG="ON"
+VERB_KERN_LOGS="n"
+INSTALL_PREFIX="/"
+LIBMODPREFIX=""
+KERNBUILDDIR="/lib/modules/`uname -r`/build"
+DEBUG="n"
+BUILD_KERNEL="y"
+BUILD_USER="y"
+CLANG_PREFIX=""
+IWYU="n"
+USE_CLANG="n"
+OPTIMIZE="n"
+KER_INSTALL_DEPS="ker"
+
+# Option parsing
+while [[ $# > 0 ]]
+do
+    key="$1"
+    case $key in
+        "-h")
+            usage
+            exit 0
+        ;;
+
+        "--help")
+            usage
+            exit 0
+        ;;
+
+        "--prefix")
+        if [ -n "$2" ]; then
+            INSTALL_PREFIX=$2
+            shift
+        else
+            echo "--prefix requires a path argument"
+            exit 255
+        fi
+        ;;
+
+        "--kernbuilddir")
+        if [ -n "$2" ]; then
+            KERNBUILDDIR=$2
+            shift
+        else
+            echo "--kernbuilddir requires a path argument"
+            exit 255
+        fi
+        ;;
+
+        "--libmodprefix")
+        if [ -n "$2" ]; then
+            LIBMODPREFIX=$2
+            shift
+        else
+            echo "--libmodprefix requires a path argument"
+            exit 255
+        fi
+        ;;
+
+        "--shim-udp4")
+        WITH_SHIM_UDP4="y"
+        ;;
+
+        "--no-shim-udp4")
+        WITH_SHIM_UDP4="n"
+        ;;
+
+        "--shim-tcp4")
+        WITH_SHIM_TCP4="y"
+        ;;
+
+        "--no-shim-tcp4")
+        WITH_SHIM_TCP4="n"
+        ;;
+
+        "--skbuffs")
+        WITH_SKBUFFS="y"
+        ;;
+
+        "--no-skbuffs")
+        WITH_SKBUFFS="n"
+        ;;
+
+        "--swig")
+        WITH_SWIG="ON"
+        ;;
+
+        "--no-swig")
+        WITH_SWIG="OFF"
+        ;;
+
+        "--verbose-kernel")
+        VERB_KERN_LOGS="y"
+        ;;
+
+        "--no-kernel")
+        BUILD_KERNEL="n"
+        ;;
+
+        "--no-user")
+        BUILD_USER="n"
+        ;;
+
+        "--debug")
+        DEBUG="y"
+        ;;
+
+        "--opt")
+        OPTIMIZE="y"
+        ;;
+
+        "--sanitize-includes")
+        IWYU="y"
+        ;;
+
+        "--clang")
+        USE_CLANG="y"
+        ;;
+
+        *)
+        echo "Unknown option '$key'"
+        echo "Try ./configure --help"
+        exit 255
+        ;;
+    esac
+    shift
+done
+
+if [ ${BUILD_KERNEL} == "y" ]; then
+    # Check if kernel headers are there for out-of-tree build
+    if [ ! -d $KERNBUILDDIR ]; then
+        printmsg "Cannot find '$KERNBUILDDIR' kernel build directory"
+        printmsg "Make sure headers for the running kernel are installed"
+        exit 255
+    fi
+fi
+
+if [ ${BUILD_USER} == "y" ]; then
+    # Make sure CMake is installed
+    which cmake || no_cmake
+    # Check if we have
+    if [ $DEBUG == "y" ]; then
+        # In case of debug build we clean KER_INSTALL_DEPS
+        # as a workaround for the travis build, that does not
+        # have "scan-build" available for the superuser (and the
+        # ker target is invoked on "sudo make install")
+        KER_INSTALL_DEPS=""
+        if [ $(which scan-build) ]; then
+            CLANG_PREFIX="scan-build"
+        fi
+    fi
+fi
+
+rm -f config.log
+
+if [[ -d .git ]]; then
+    REVISION=$(git rev-parse --verify HEAD)
+    if [ "$?" != "0" ]; then
+        REVISION="(unknown)"
+        REVISION_DATE="$REVISION"
+    else
+        REVISION_DATE=$(git show -s --format=%cd $REVISION)
+    fi
+else
+    REVISION="(unknown)"
+    REVISION_DATE="$(date)"
+fi
+
+cat >> config.log <<EOF
+##############################################################################
+# CONFIGURING RLITE FOR BUILD
+#     build date:    $(date)
+#     revision id:   $REVISION
+#     revision date: ${REVISION_DATE}
+#     build kernel:  ${BUILD_KERNEL}
+#     build user:    ${BUILD_USER}
+##############################################################################
+EOF
+
+# Generate symbolic links for common code
+(
+cd kernel
+ln -sf ../common/ker-numtables.c ker-numtables.c
+ln -sf ../common/utils.c utils.c
+)
+
+(
+cd user/libs
+ln -sf ../../common/ker-numtables.c ker-numtables.c
+ln -sf ../../common/utils.c utils.c
+)
+
+if [[ "$USE_CLANG" == "y" ]]; then
+    export CC=/usr/bin/clang
+    export CXX=/usr/bin/clang++
+fi
+
+if [ ${BUILD_USER} == "y" ]; then
+    # Configure CMake for out-of-tree build
+    rm -rf build &> /dev/null
+    mkdir build || exit 255
+
+    if [ "$IWYU" == "y" ]; then
+        CMAKE_EXTRA+="-DCMAKE_CXX_INCLUDE_WHAT_YOU_USE=/usr/bin/iwyu;-Xiwyu;any;-Xiwyu;iwyu;-Xiwyu;args"
+        CMAKE_EXTRA+="-DCMAKE_C_INCLUDE_WHAT_YOU_USE=/usr/bin/iwyu;-Xiwyu;any;-Xiwyu;iwyu;-Xiwyu;args"
+    fi
+
+    (
+    cd build
+    ${CLANG_PREFIX} cmake .. -DCMAKE_INSTALL_PREFIX=${INSTALL_PREFIX} -DCMAKE_BUILD_TYPE=Debug -DDEBUG=${DEBUG} -DOPTIMIZE=${OPTIMIZE} -DWITH_SWIG=${WITH_SWIG} ${CMAKE_EXTRA}
+    ) | tee -a config.log
+fi
+
+# Generate the main Makefile
+cp Makefile.in Makefile
+sed -i "s|@INSTALL_MOD_PATH@|${INSTALL_PREFIX}${LIBMODPREFIX}|g" Makefile
+sed -i "s|@ROOTDIR@|$PWD|g" Makefile
+sed -i "s|@KERNBUILDDIR@|$KERNBUILDDIR|g" Makefile
+sed -i "s|@CLANG_PREFIX@|${CLANG_PREFIX}|g" Makefile
+sed -i "s|@WITH_SHIM_UDP4@|${WITH_SHIM_UDP4}|g" Makefile
+sed -i "s|@WITH_SHIM_TCP4@|${WITH_SHIM_TCP4}|g" Makefile
+sed -i "s|@KER_INSTALL_DEPS@|${KER_INSTALL_DEPS}|g" Makefile
+
+if [ ${BUILD_KERNEL} == "y" ]; then
+    # Generate kernel Makefile
+    cp kernel/Makefile.in kernel/Makefile
+    if [ $WITH_SHIM_UDP4 == "y" ]; then
+        cat >> kernel/Makefile <<EOF
+
+obj-m += rlite-shim-udp4.o
+rlite-shim-udp4-y := shim-udp4.o
+EOF
+    fi
+    if [ $WITH_SHIM_TCP4 == "y" ]; then
+        cat >> kernel/Makefile <<EOF
+
+obj-m += rlite-shim-tcp4.o
+rlite-shim-tcp4-y := shim-tcp4.o
+EOF
+    fi
+    generate_flavours
+
+    # Generate kerconfig.h file
+    KCF=kernel/kerconfig.h
+    cat > $KCF <<EOF
+#ifndef __RLITE_KERCONFIG_H__
+#define __RLITE_KERCONFIG_H__
+EOF
+
+    if [ $WITH_SKBUFFS == "y" ]; then
+        echo '#define RL_SKB /* Use native Linux sk_buff */' >> $KCF
+    fi
+
+    if [ $VERB_KERN_LOGS == "y" ]; then
+        echo '#define RL_PV_ENABLE /* Compile PV() conditional logs */' >> $KCF
+    fi
+
+    if [ $DEBUG == "y" ]; then
+        echo '#define RL_MEMTRACK /* Track memory alloc/dealloc */' >> $KCF
+    fi
+
+    probe_kernel_features
+
+    echo '#endif' >> $KCF
+fi
+
+VERF=include/rlite/version.h
+echo "#ifndef __RLITE_VERSION_H__" > $VERF
+echo "#define __RLITE_VERSION_H__" >> $VERF
+echo "#define RL_REVISION_ID \"$REVISION\"" >> $VERF
+echo "#define RL_REVISION_DATE \"$REVISION_DATE\"" >> $VERF
+echo "#endif" >> $VERF

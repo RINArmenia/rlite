@@ -1,0 +1,17 @@
+[Unit]
+Description=rlite daemon running uipcps
+#ConditionPathExists=/etc/rina/uipcp-qoscubes.qos
+#ConditionPathExists=/etc/rina/shim-tcp4-dir
+Requires=systemd-modules-load.service
+After=systemd-modules-load.service
+#After=network.target
+
+[Service]
+Type=forking
+ExecStart=/usr/bin/rlite-uipcps -d
+PIDFile=/run/rlite/uipcps.pid
+#WorkingDirectory=
+#Restart=on-failure
+
+[Install]
+WantedBy=multi-user.target
